@@ -1,76 +1,99 @@
 const express = require('express');
-const cors = require('cors');
 const axios = require('axios');
+const cors = require('cors');
+require('dotenv').config();
+
 const app = express();
-app.use(cors({ origin: '*' }));
+app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
-const CONSUMER_KEY = process.env.CONSUMER_KEY;
-const CONSUMER_SECRET = process.env.CONSUMER_SECRET;
-const SHORTCODE = process.env.SHORTCODE || '6515784';
-const TILL = process.env.TILL || '8794672';
-const PASSKEY = process.env.PASSKEY;
 
-console.log('ENV CHECK:', { HAS_KEY: !!CONSUMER_KEY, HAS_SECRET: !!CONSUMER_SECRET, SHORTCODE, TILL, HAS_PASSKEY: !!PASSKEY, PASSKEY_LEN: PASSKEY?.length });
-
-app.get('/', (req,res) => {
-  res.send(`Till ${TILL} LIVE - ENV: KEY=${!!CONSUMER_KEY} SECRET=${!!CONSUMER_SECRET} PASSKEY=${!!PASSKEY}`);
+// Log ENV on startup
+console.log("ENV CHECK:", {
+  SHORTCODE: process.env.SHORTCODE,
+  TILL: process.env.TILL,
+  HAS_KEY: !!process.env.CONSUMER_KEY,
+  HAS_SECRET: !!process.env.CONSUMER_SECRET,
+  HAS_PASSKEY: !!process.env.PASSKEY,
+  PASSKEY_LEN: process.env.PASSKEY ? process.env.PASSKEY.length : 0
 });
 
-async function getToken() {
-  if(!CONSUMER_KEY || !CONSUMER_SECRET) throw new Error('Missing CONSUMER_KEY or SECRET in Render env');
-  const auth = Buffer.from(`${CONSUMER_KEY}:${CONSUMER_SECRET}`).toString('base64');
-  const { data } = await axios.get('https://api.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials', {
+app.get('/', (req, res) => {
+  res.send(`Till ${process.env.TILL} LIVE - ENV: KEY=${!!process.env.CONSUMER_KEY} SECRET=${!!process.env.CONSUMER_SECRET} PASSKEY=${!!process.env.PASSKEY}`);
+});
+
+// Get Daraja Token
+async function getAccessToken() {
+  const auth = Buffer.from(`${process.env.CONSUMER_KEY}:${process.env.CONSUMER_SECRET}`).toString('base64');
+  const url = 'https://api.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials';
+  const response = await axios.get(url, {
     headers: { Authorization: `Basic ${auth}` }
   });
-  return data.access_token;
+  return response.data.access_token;
 }
 
-app.post('/api/stk-push', async (req,res) => {
+// STK PUSH - FOR TILL 8794672
+app.post('/stkpush', async (req, res) => {
+  const { phone, amount } = req.body;
+  console.log("STK Request:", { phone, amount, odds: req.body.odds });
+
   try {
-    if(!PASSKEY) return res.status(500).json({ success: false, error: "PASSKEY missing in Render Environment - Add it!" });
-    let p = String(req.body.phone).replace(/\D/g,'');
-    if(p.startsWith('0')) p = '254'+p.slice(1);
-    if(p.startsWith('7')) p = '254'+p;
-    
-    console.log('STK Request:', { phone: p, amount: req.body.amount, odds: req.body.odds });
-    const token = await getToken();
-    const timestamp = new Date().toISOString().replace(/[^0-9]/g,'').slice(0,14);
-    const password = Buffer.from(`${SHORTCODE}${PASSKEY}${timestamp}`).toString('base64');
-    
-    const payload = {
-      BusinessShortCode: SHORTCODE,
+    const token = await getAccessToken();
+    const timestamp = new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14);
+    const password = Buffer.from(`${process.env.SHORTCODE}${process.env.PASSKEY}${timestamp}`).toString('base64');
+
+    const stkData = {
+      BusinessShortCode: process.env.SHORTCODE, // 6515784
       Password: password,
       Timestamp: timestamp,
       TransactionType: "CustomerBuyGoodsOnline",
-      Amount: Math.round(Number(req.body.amount)),
-      PartyA: p,
-      PartyB: "8794672",
-      PhoneNumber: p,
-      CallBackURL: `https://sportsextra-backend-1.onrender.com/api/mpesa/callback`,
-      AccountReference: "SPORTSEXTRA",
-      TransactionDesc: `Ksh ${req.body.amount} for ${req.body.odds} Odds`
+      Amount: Number(amount),
+      PartyA: phone,
+      PartyB: process.env.TILL, // 8794672
+      PhoneNumber: phone,
+      CallBackURL: "https://sportsextra-backend-1.onrender.com/callback",
+      AccountReference: "SportsExtra",
+      TransactionDesc: "Bet Payment"
     };
-    
-    console.log('Sending to Safaricom:', payload);
-    const { data } = await axios.post('https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest', payload, {
-      headers: { Authorization: `Bearer ${token}` }
+
+    console.log("Sending to Safaricom:", { 
+      BusinessShortCode: stkData.BusinessShortCode,
+      PartyB: stkData.PartyB,
+      Amount: stkData.Amount,
+      Phone: stkData.PhoneNumber,
+      Timestamp: timestamp
     });
+
+    const response = await axios.post(
+      'https://api.safaricom.co.ke/mpesa/stkpush/v1/processquery',
+      stkData,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+
+    console.log("SAFARICOM SUCCESS:", response.data);
+    res.json(response.data);
+
+  } catch (error) {
+    // THIS IS THE IMPORTANT FIX - SHOWS REAL ERROR
+    console.log("SAFARICOM REAL ERROR:", error.response?.data || error.message);
+    console.log("SAFARICOM STATUS:", error.response?.status);
+    console.log("FULL ERROR JSON:", JSON.stringify(error.response?.data));
     
-    console.log('Safaricom Success:', data);
-    res.json({ success: true, ...data });
-    
-  } catch (e) {
-    const realError = e.response?.data || e.message;
-    console.error('SAFARICOM REAL ERROR:', JSON.stringify(realError, null, 2));
-    res.status(500).json({ success: false, error: realError, details: "Check Render Logs for REAL ERROR" });
+    res.status(400).json({
+      error: error.response?.data || error.message,
+      status: error.response?.status
+    });
   }
 });
 
-app.post('/api/mpesa/callback', (req,res) => {
-  console.log('CALLBACK:', JSON.stringify(req.body, null, 2));
-  res.json({ ResultCode: 0, ResultDesc: "Accepted Till 8794672" });
+app.post('/callback', (req, res) => {
+  console.log("CALLBACK RECEIVED:", JSON.stringify(req.body));
+  res.json({ ResultCode: 0, ResultDesc: "Success" });
 });
 
-app.listen(PORT, () => console.log(`LIVE Till ${TILL} on ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`LIVE Till ${process.env.TILL} on ${PORT}`);
+  console.log(`==> Your service is live`);
+  console.log(`==> Available at your primary URL https://sportsextra-backend-1.onrender.com`);
+});
